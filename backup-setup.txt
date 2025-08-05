@@ -1,0 +1,163 @@
+Requirements Recap
+
+final complete setup for PostgreSQL backup, streaming replication, and Point-In-Time Recovery (PITR) for 50 store systems with a single central server:
+
+Task
+Local Store
+Central Server
+PostgreSQL Port
+5432 (same for all)
+Unique (5433 to 5482)
+Backups (.dump, base, WALs)
+Local + Push to Central
+Stores received backups
+Streaming Replication
+Push from Local to Central
+50 replica clusters
+PITR Support (if store crashes)
+✅ via local or central
+✅ via archived WALs
+Auto Restore to Remote (optional)
+❌ (not needed)
+✅ (for backup validation)
+
+
+1. Local Store Server Setup (per store)
+
+Daily Backup Script (local_backup.sh)
+
+cat local_backup.sh
+#!/bin/bash
+set -e
+
+# === Configuration ===
+STORE_NAME="store1"
+DB_NAME="odoo17-server1"
+DB_USER="odoo"
+PGPASSWORD="admin"
+export PGPASSWORD
+
+BACKUP_BASE="/home/odoo/backups/${STORE_NAME}"
+DATE=$(date +%Y-%m-%d_%H-%M-%S)
+REMOTE_USER="odoo"
+REMOTE_HOST="172.31.84.29"  # central server IP
+
+mkdir -p "${BACKUP_BASE}/dumps" "${BACKUP_BASE}/base" "${BACKUP_BASE}/wal"
+
+# Dump file
+DUMP_NAME="${DB_NAME}_${DATE}.dump"
+pg_dump -Fc -U "$DB_USER" "$DB_NAME" -f "${BACKUP_BASE}/dumps/$DUMP_NAME"
+
+# Base Backup
+rm -rf "${BACKUP_BASE}/base"/*
+pg_basebackup -U "$DB_USER" -D "${BACKUP_BASE}/base" -F tar -X fetch -z -P --wal-method=fetch
+#pg_basebackup -U "$DB_USER" -D "${BACKUP_BASE}/base/${DATE}" -F tar -X fetch -z -P --wal-method=fetch
+
+# Archive WALs
+WAL_ARCHIVE_SRC="/home/odoo/backups/store1/wal"
+#WAL_ARCHIVE_DST="${BACKUP_BASE}/wal/${DATE}"
+WAL_ARCHIVE_DST="${BACKUP_BASE}/wal"
+mkdir -p "$WAL_ARCHIVE_DST"
+rsync -a --exclude="${DATE}" "${WAL_ARCHIVE_SRC}/" "$WAL_ARCHIVE_DST/" || echo "No WALs copied."
+
+# Push to central
+scp -r "${BACKUP_BASE}/" "$REMOTE_USER@$REMOTE_HOST:/home/odoo/central_backups/"
+
+
+
+2. Central Server Setup
+
+Directory Structure (per store):
+
+/home/odoo/central_backups/store1/
+/home/odoo/central_backups/store2/
+/home/odoo/central_backups/storeN/
+
+Each directory will contain: dumps/, base/, and wal/
+
+Streaming Replication: One Replica Cluster per Store
+For each store, create a new PostgreSQL instance:
+
+# Repeat for store1 to store50
+sudo pg_createcluster 16 store1 --port=5433 --start
+sudo pg_createcluster 16 store2 --port=5434 --start
+...
+
+Replication Setup Steps (per store):
+    1. Create replication user on local store:
+
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replica_pass';
+
+
+2. Add this in postgresql.conf on local:
+
+wal_level = replica
+archive_mode = on
+archive_command = 'test ! -f /var/lib/postgresql/16/archive/%f && cp %p /var/lib/postgresql/16/archive/%f'
+max_wal_senders = 10
+
+
+3. Configure pg_hba.conf on local store to allow central IP:
+
+host replication replicator <central_server_ip>/32 md5
+
+4. Create 
+
+mkdir /var/lib/postgresql/16/archive
+sudo chmod +x /var/lib/postgresql/16/archive
+sudo chown -R postgres: /var/lib/postgresql/16/archive
+
+5. On central server: initialize replica for store1
+
+sudo systemctl stop postgresql@16-store1
+
+rm -rf /var/lib/postgresql/16/store1/*
+
+PGPASSWORD=replica_pass pg_basebackup -h <store1_ip> -p 5432 -U replicator \
+-D /var/lib/postgresql/16/store1 -Fp -Xs -P -R
+
+# Modify postgresql.conf (optional: custom settings)
+echo "port = 5433" >> /etc/postgresql/16/store1/postgresql.conf
+
+sudo systemctl start postgresql@16-store1
+
+
+* Disaster Recovery with PITR (Local Store)
+If a store crashes:
+
+# Stop PostgreSQL
+sudo systemctl stop postgresql
+
+# Clear existing data
+sudo rm -rf /var/lib/postgresql/16/main/*
+
+# Restore base backup
+tar -xvf /home/odoo/backups/store1/base/<DATE>.tar.gz -C /var/lib/postgresql/16/main/
+
+# Create recovery signal
+touch /var/lib/postgresql/16/main/recovery.signal
+
+# Create restore.conf settings in postgresql.conf
+echo "restore_command = 'cp /home/odoo/backups/store1/wal/%f %p'" >> /etc/postgresql/16/main/postgresql.conf
+
+# Start PostgreSQL
+sudo systemctl start postgresql
+
+
+Optional: Auto Restore for Backup Validation (Central)
+
+If you want to verify latest .dump backups:
+
+#!/bin/bash
+STORE_NAME="store1"
+DB_USER="odoo"
+PGPASSWORD="admin"
+export PGPASSWORD
+
+DUMP_DIR="/home/odoo/central_backups/${STORE_NAME}/dumps"
+LATEST_DUMP=$(ls -t ${DUMP_DIR}/*.dump | head -n1)
+RESTORE_DB="test_restore_${STORE_NAME}"
+
+psql -U "$DB_USER" -tc "DROP DATABASE IF EXISTS $RESTORE_DB"
+psql -U "$DB_USER" -tc "CREATE DATABASE $RESTORE_DB"
+pg_restore -U "$DB_USER" -d "$RESTORE_DB" "$LATEST_DUMP"
