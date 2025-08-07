@@ -2,24 +2,12 @@ Requirements Recap
 
 final complete setup for PostgreSQL backup, streaming replication, and Point-In-Time Recovery (PITR) for 50 store systems with a single central server:
 
-Task
-Local Store
-Central Server
-PostgreSQL Port
-5432 (same for all)
-Unique (5433 to 5482)
-Backups (.dump, base, WALs)
-Local + Push to Central
-Stores received backups
-Streaming Replication
-Push from Local to Central
-50 replica clusters
-PITR Support (if store crashes)
-✅ via local or central
-✅ via archived WALs
-Auto Restore to Remote (optional)
-❌ (not needed)
-✅ (for backup validation)
+      Task                              Local Store                     Central Server
+PostgreSQL Port                     5432 (same for all)             Unique (5433 to 5482)
+Backups (.dump, base, WALs)         Local + Push to Central         Stores received backups
+Streaming Replication               Push from Local to Central      50 replica clusters
+PITR Support (if store crashes)     ✅ via local or central         ✅ via archived WALs
+Auto Restore to Remote (optional)   ❌ (not needed)                 ✅ (for backup validation)
 
 
 1. Local Store Server Setup (per store)
